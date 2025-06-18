@@ -1,0 +1,248 @@
+
+##### Creatung the GAIN myself #### GAIN Imputation Architecture and Confuiguration
+##  NB that the code might change depending in the variables 
+## My variables are columns=['pweight', 'sex', 'age', 'BPs', 'height', 'weight', 'WC', 'HC',
+       'curr_use_tobacco', 'stroke', 'suddenparalysisonbody', 'angina',
+       'chestpainafternormalwalk', 'hypertension']
+
+## If not already available, install the packages below
+!pip install torch scikit-learn tensorflow  keras
+
+###### Creating GAIN for Imputations
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
+from sklearn.preprocessing import LabelEncoder, MinMaxScaler
+from sklearn.utils import shuffle
+import numpy as np
+import pandas as pd
+
+
+class GAINImputer:
+    def __init__(self, hint_rate=0.9, alpha=1.0, batch_size=64, epochs=100, device=None, max_smokers=1000):
+        """
+        hint_rate: fraction of mask values to reveal to discriminator
+        alpha: weight for generator adversarial loss
+        batch_size: size of mini-batches
+        epochs: number of training epochs
+        device: computation device (cuda or cpu)
+        max_smokers: maximum number of 'yes' in curr_use_tobacco
+        """
+        self.hint_rate = hint_rate
+        self.alpha = alpha
+        self.batch_size = batch_size
+        self.epochs = epochs
+        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.max_smokers = max_smokers
+        self.num_cols = []
+        self.cat_cols = []
+        self.full_columns = []
+        self.label_encoders = {}
+        self.scaler = MinMaxScaler()
+        self.categorical_indices = []
+
+    def _preprocess(self, df):
+        """Preprocess mixed data types (numerical and categorical)"""
+        self.full_columns = df.columns.tolist()
+        self.num_cols = ['pweight', 'age', 'BPs', 'height', 'weight', 'WC', 'HC']
+        self.cat_cols = ['sex', 'curr_use_tobacco', 'stroke', 'suddenparalysisonbody', 'angina', 'chestpainafternormalwalk', 'hypertension']
+        self.categorical_indices = [self.full_columns.index(col) for col in self.cat_cols]
+
+        # Scale numeric features to [0,1]
+        num_data = self.scaler.fit_transform(df[self.num_cols]) if self.num_cols else np.empty((len(df), 0))
+
+        # Encode categorical columns (sex: male=0/female=1, others: no=0/yes=1)
+        cat_data = []
+        for col in self.cat_cols:
+            col_series = df[col].astype(str).copy()
+            mask = col_series == 'nan'
+            valid_data = col_series[~mask]
+            le = LabelEncoder()
+            le.fit(valid_data)
+            self.label_encoders[col] = le
+            encoded = np.zeros(len(col_series), dtype=float)
+            encoded[~mask] = [0 if x == 'male' or x == 'no' else 1 for x in valid_data]
+            if mask.sum() > 0:
+                if col == 'curr_use_tobacco':
+                    # Bias toward 'no' to limit smokers
+                    probs = 0.15  # Target ~15% smokers (~710)
+                    encoded[mask] = np.random.choice([0, 1], size=mask.sum(), p=[1-probs, probs])
+                else:
+                    observed_vals = encoded[~mask]
+                    probs = np.mean(observed_vals) if len(observed_vals) > 0 else 0.5
+                    encoded[mask] = np.random.choice([0, 1], size=mask.sum(), p=[1-probs, probs])
+            cat_data.append(encoded.reshape(-1, 1))
+        cat_data = np.hstack(cat_data) if cat_data else np.empty((len(df), 0))
+
+        data = np.hstack([num_data, cat_data])
+        mask = ~df[self.full_columns].isna().values.astype(bool)
+        print(f"Missing values per column: {np.sum(~mask, axis=0)}")
+        return data, mask
+
+    def _postprocess(self, imputed, df):
+        """Convert imputed data back to original format and enforce smoker constraint"""
+        n_num = len(self.num_cols)
+        num_part = imputed[:, :n_num]
+        cat_part = imputed[:, n_num:]
+
+        # Inverse scale numeric features
+        num_data = self.scaler.inverse_transform(num_part) if self.num_cols else np.empty((imputed.shape[0], 0))
+
+        # Decode categorical columns
+        cat_data = []
+        for i, col in enumerate(self.cat_cols):
+            vals = (cat_part[:, i] >= 0.5).astype(int)
+            if col == 'sex':
+                decoded = np.where(vals == 0, 'male', 'female')
+            else:
+                decoded = np.where(vals == 0, 'no', 'yes')
+            cat_data.append(decoded)
+        cat_data = pd.DataFrame(np.array(cat_data).T, columns=self.cat_cols)
+
+        # Enforce max_smokers constraint
+        tobacco_col = cat_data['curr_use_tobacco']
+        smoker_indices = tobacco_col[tobacco_col == 'yes'].index
+        original_smokers = df['curr_use_tobacco'].eq('yes').sum()
+        imputed_smokers = len(smoker_indices) - original_smokers
+        if len(smoker_indices) > self.max_smokers:
+            excess_smokers = len(smoker_indices) - self.max_smokers
+            # Randomly reassign excess imputed smokers to 'no'
+            reassign_indices = np.random.choice(smoker_indices, excess_smokers, replace=False)
+            cat_data.loc[reassign_indices, 'curr_use_tobacco'] = 'no'
+
+        num_df = pd.DataFrame(num_data, columns=self.num_cols)
+        result = pd.concat([num_df, cat_data], axis=1)[self.full_columns]
+        return result
+
+    class Generator(nn.Module):
+        def __init__(self, dim, cat_indices):
+            super().__init__()
+            self.cat_indices = cat_indices
+            self.fc = nn.Sequential(
+                nn.Linear(dim * 2, 128),
+                nn.ReLU(),
+                nn.Linear(128, 128),
+                nn.ReLU(),
+                nn.Linear(128, dim)
+            )
+        
+        def forward(self, x, m):
+            output = self.fc(torch.cat([x, m], dim=1))
+            if self.cat_indices:
+                output[:, self.cat_indices] = torch.sigmoid(output[:, self.cat_indices])
+            return output
+
+    class Discriminator(nn.Module):
+        def __init__(self, dim):
+            super().__init__()
+            self.fc = nn.Sequential(
+                nn.Linear(dim * 2, 128),
+                nn.ReLU(),
+                nn.Linear(128, 128),
+                nn.ReLU(),
+                nn.Linear(128, dim),
+                nn.Sigmoid()
+            )
+        
+        def forward(self, x, h):
+            return self.fc(torch.cat([x, h], dim=1))
+
+    def _create_hint(self, m):
+        """Create hint matrix for discriminator"""
+        hint = m * torch.rand_like(m)
+        return (hint > (1 - self.hint_rate)).float()
+
+    def fit_transform(self, df):
+        """Train GAIN and impute missing values"""
+        data, mask = self._preprocess(df)
+        data = np.nan_to_num(data, nan=0.0)
+        mask = mask.astype(float)
+
+        data_tensor = torch.FloatTensor(data).to(self.device)
+        mask_tensor = torch.FloatTensor(mask).to(self.device)
+
+        self.gen = self.Generator(data.shape[1], self.categorical_indices).to(self.device)
+        self.dis = self.Discriminator(data.shape[1]).to(self.device)
+        g_opt = torch.optim.Adam(self.gen.parameters(), lr=1e-3, betas=(0.5, 0.9))
+        d_opt = torch.optim.Adam(self.dis.parameters(), lr=5e-4, betas=(0.5, 0.9))
+        g_scheduler = torch.optim.lr_scheduler.StepLR(g_opt, step_size=50, gamma=0.5)
+        d_scheduler = torch.optim.lr_scheduler.StepLR(d_opt, step_size=50, gamma=0.5)
+
+        loader = DataLoader(TensorDataset(data_tensor, mask_tensor), batch_size=self.batch_size, shuffle=True)
+
+        for epoch in range(self.epochs):
+            g_loss_total = 0
+            d_loss_total = 0
+            for x, m in loader:
+                x, m = x.to(self.device), m.to(self.device)
+                h = self._create_hint(m)
+
+                # Discriminator update
+                d_opt.zero_grad()
+                gen_x = self.gen(x, m).detach()
+                x_hat = m * x + (1 - m) * gen_x
+                d_pred = self.dis(x_hat, h)
+                d_loss = -torch.mean(m * torch.log(d_pred + 1e-8) + (1 - m) * torch.log(1 - d_pred + 1e-8))
+                d_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.dis.parameters(), 1.0)
+                d_opt.step()
+
+                # Generator update
+                g_opt.zero_grad()
+                gen_x = self.gen(x, m)
+                x_hat = m * x + (1 - m) * gen_x
+                d_pred = self.dis(x_hat, h)
+
+                # Mixed loss: MSE for numerical, weighted BCE for categorical
+                mse_loss = F.mse_loss(m * x_hat, m * x) if self.num_cols else 0.0
+                bce_loss = torch.tensor(0.0, device=self.device)
+                for i in self.categorical_indices:
+                    weights = m[:, i] + (1 - m[:, i]) * 2.0
+                    bce = F.binary_cross_entropy_with_logits(
+                        gen_x[:, i], x[:, i], reduction='none'
+                    )
+                    weighted_bce = (bce * weights).mean()
+                    bce_loss += weighted_bce
+                if len(self.categorical_indices) > 0:
+                    bce_loss /= len(self.categorical_indices)
+                rec_loss = mse_loss + bce_loss
+                adv_loss = F.binary_cross_entropy(d_pred, torch.ones_like(d_pred))
+                g_loss = rec_loss + self.alpha * adv_loss
+
+                g_loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.gen.parameters(), 1.0)
+                g_opt.step()
+
+                g_loss_total += g_loss.item()
+                d_loss_total += d_loss.item()
+
+            g_scheduler.step()
+            d_scheduler.step()
+
+            if (epoch + 1) % 10 == 0:
+                print(f"Epoch {epoch+1}/{self.epochs} | G Loss: {g_loss_total/len(loader):.6f} | D Loss: {d_loss_total/len(loader):.6f}")
+
+        with torch.no_grad():
+            gen_imputed = self.gen(data_tensor, mask_tensor)
+            final = mask_tensor * data_tensor + (1 - mask_tensor) * gen_imputed
+            imputed_df = self._postprocess(final.cpu().numpy(), df)
+            print("\nNaN counts after imputation:")
+            print(imputed_df.isna().sum())
+            print(f"\nNumber of smokers (curr_use_tobacco = 'yes'): {imputed_df['curr_use_tobacco'].eq('yes').sum()}")
+            return imputed_df
+
+
+### Now Apply the Code to the data of Choice.
+
+imputer=GAINImputer(hint_rate=0.9, alpha=1.0, batch_size=64, epochs=100)
+
+## My data is called GD
+imputed_data =imputer.fit_transform(GD) ## Insert your data
+
+### Checking the Newly Imputed Data
+print(imputed_data)
+
+### Check the distribution of one of the variables
+imputed_data['curr_use_tobacco'].value_counts()
+
