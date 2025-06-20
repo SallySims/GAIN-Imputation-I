@@ -7,304 +7,409 @@
 !pip install torch scikit-learn tensorflow  keras
 
 ###### Creating GAIN for Imputations
-
-#### #####
-!pip install keras torch tensorflow 
+############### Creating the GAIN Imputer for the Study ##############
+!pip install keras torch tensorflow
+# Install necessary libraries (uncomment if running in a fresh environment)
 import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from sklearn.preprocessing import MinMaxScaler, OneHotEncoder
-from typing import Tuple, Dict, List
+from typing import Tuple, List
+from tqdm import tqdm
 
-# ----------------------
-# Utility functions
-# ----------------------
+############# Numerical Data Imputations #######
 
-def sample_z(shape: Tuple[int, ...]) -> torch.Tensor:
-    """Sample uniform noise in [0,1] for generator input."""
-    return torch.rand(shape)
+# Creatung the Helper Functions
+def sample_noise(shape: Tuple[int, ...], device: torch.device) -> torch.Tensor:
+    return torch.rand(shape, device=device) * 0.01
 
-def sample_h(mask: torch.Tensor, hint_rate: float = 0.9) -> torch.Tensor:
-    """
-    Sample hint vector H: randomly reveal observed values with probability hint_rate.
-    H = M * B + 0.5 * (1 - B), where B is a Bernoulli mask.
-    """
-    B = torch.rand_like(mask) < hint_rate
-    return B.float() * mask + 0.5 * (1 - B.float())
+def sample_hint(mask: torch.Tensor, hint_rate: float = 0.9) -> torch.Tensor:
+    hint_prob = torch.rand_like(mask) < hint_rate
+    return hint_prob.float() * mask + 0.5 * (1 - hint_prob.float())
 
-# ----------------------
-# Neural Networks
-# ----------------------
-
+# Creating the Generator
 class Generator(nn.Module):
-    def __init__(self, input_dim: int, numeric_cols: List[str], categorical_dims: Dict[str, int]):
-        super().__init__()
-        self.input_dim = input_dim
-        self.num_cols = len(numeric_cols)
-        self.categorical_dims = categorical_dims
-        self.output_dim = self.num_cols + sum(categorical_dims.values())
-        
-        # Shared layers with dropout for regularization
-        self.shared = nn.Sequential(
-            nn.Linear(input_dim * 2, 256),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.1),
-            nn.Linear(256, 128),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.1)
-        )
-        
-        # Numerical output
-        self.numerical_out = nn.Sequential(
-            nn.Linear(128, self.num_cols) if self.num_cols > 0 else nn.Identity(),
-            nn.Sigmoid() if self.num_cols > 0 else nn.Identity()
-        )
-        
-        # Categorical outputs
-        self.categorical_out = nn.ModuleDict()
-        for col, dim in categorical_dims.items():
-            if dim == 1:  # Binary categorical
-                self.categorical_out[col] = nn.Sequential(
-                    nn.Linear(128, 1),
-                    nn.Sigmoid()
-                )
-            else:  # Multi-class categorical
-                self.categorical_out[col] = nn.Sequential(
-                    nn.Linear(128, dim),
-                    nn.Softmax(dim=1)
-                )
-
-    def forward(self, x: torch.Tensor, mask: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
-        assert x.shape[1] == self.input_dim, f"Input dim mismatch: expected {self.input_dim}, got {x.shape[1]}"
-        
-        x_input = x * mask + z * (1 - mask)
-        shared_out = self.shared(torch.cat([x_input, mask], dim=1))
-        
-        # Numerical output
-        num_out = self.numerical_out(shared_out)
-        
-        # Categorical outputs
-        cat_outs = []
-        for col in self.categorical_out:
-            cat_out = self.categorical_out[col](shared_out)
-            cat_outs.append(cat_out)
-        
-        output = torch.cat([num_out] + cat_outs, dim=1) if cat_outs else num_out
-        assert output.shape[1] == self.output_dim, f"Output dim mismatch: expected {self.output_dim}, got {output.shape[1]}"
-        return output
-
-class Discriminator(nn.Module):
-    def __init__(self, input_dim: int):
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
         super().__init__()
         self.model = nn.Sequential(
-            nn.Linear(input_dim * 2, 256),
-            nn.LeakyReLU(0.2),
+            nn.Linear(input_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(256, 128),
-            nn.LeakyReLU(0.2),
-            nn.Dropout(0.1),
-            nn.Linear(128, input_dim),
+            nn.Linear(hidden_dim // 2, input_dim),
             nn.Sigmoid()
         )
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            nn.init.constant_(module.bias, 0)
+    
+    def forward(self, x: torch.Tensor, mask: torch.Tensor, noise: torch.Tensor) -> torch.Tensor:
+        x_input = x * mask + noise * (1 - mask)
+        return self.model(torch.cat([x_input, mask], dim=1))
+
+# Creatng the  Discriminator
+class Discriminator(nn.Module):
+    def __init__(self, input_dim: int, hidden_dim: int = 128):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim * 2, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(hidden_dim // 2, input_dim),
+            nn.Sigmoid()
+        )
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            nn.init.constant_(module.bias, 0)
     
     def forward(self, x_hat: torch.Tensor, hint: torch.Tensor) -> torch.Tensor:
         return self.model(torch.cat([x_hat, hint], dim=1))
 
-# ----------------------
-# Preprocessing
-# ----------------------
+#  Creating the Data Preprocessor Section
+class DataPreprocessor:
+    def __init__(self):
+        self.scalers = {}
+        self.numeric_cols = []
+        self.original_columns = []
+    
+    def fit_transform(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+        if df.empty:
+            raise ValueError("Input DataFrame is empty")
+        
+        self.original_columns = df.columns.tolist()
+        self.numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if not self.numeric_cols:
+            raise ValueError("No numerical columns found in DataFrame")
+        
+        df_processed = df[self.numeric_cols].copy()
+        
+        # Process numerical columns
+        for col in self.numeric_cols:
+            scaler = MinMaxScaler(feature_range=(0.01, 0.99))
+            values = df_processed[col].values.reshape(-1, 1).astype(np.float32)
+            mask = ~np.isnan(values).flatten()
+            if mask.sum() > 0:
+                scaler.fit(values[mask].reshape(-1, 1))
+                df_processed.loc[mask, col] = scaler.transform(values[mask].reshape(-1, 1)).flatten()
+            else:
+                scaler.fit(np.array([[0], [1]]))
+                df_processed[col] = 0.5
+            self.scalers[col] = scaler
+        
+        data = df_processed.values.astype(np.float32)
+        mask = (~df_processed.isna()).values.astype(np.float32)
+        data[np.isnan(data)] = 0.5
+        
+        return data, mask, self.numeric_cols
+    
+    def inverse_transform(self, data: np.ndarray, columns: List[str]) -> pd.DataFrame:
+        df_result = pd.DataFrame(data, columns=columns, index=range(data.shape[0]))
+        
+        # Inverse transform numerical columns
+        for col in self.numeric_cols:
+            if col in self.scalers:
+                df_result[col] = self.scalers[col].inverse_transform(df_result[[col]].values).flatten()
+        
+        return df_result[self.numeric_cols]
 
-def preprocess_data(df: pd.DataFrame) -> Tuple[pd.DataFrame, np.ndarray, Dict[str, MinMaxScaler], Dict[str, OneHotEncoder], List[str], List[str], Dict[str, int]]:
-    df_proc = df.copy()
-    scalers = {}
-    encoders = {}
-    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
-    categorical_cols = [col for col in df.columns if df[col].dtype.name in ['object', 'category'] and df[col].dropna().nunique() >= 2]
-    encoded_cols = numeric_cols.copy()
-    categorical_dims = {}
-    
-    # Debug: Print column types and missingness
-    print("Column dtypes:")
-    print(df_proc.dtypes)
-    print("Missingness rates:")
-    print(df_proc.isna().mean())
-    
-    # Process numerical columns
-    for col in numeric_cols:
-        scaler = MinMaxScaler()
-        values = df_proc[col].values.astype(float).reshape(-1, 1)
-        mask = ~np.isnan(values).flatten()
-        if mask.sum() > 0:
-            clean_vals = values[mask].reshape(-1, 1)
-            low, high = np.percentile(clean_vals, [1, 99])
-            clipped_vals = np.clip(clean_vals, low, high)
-            scaler.fit(clipped_vals)
-            scaled = scaler.transform(values)
-            scaled[~mask] = 0.5
-            df_proc[col] = scaled.flatten()
-        else:
-            df_proc[col] = 0.5
-        scalers[col] = scaler
-    
-    # Process categorical columns
-    for col in categorical_cols:
-        # Convert categorical to object to avoid CategoricalDtype restrictions
-        df_proc[col] = df_proc[col].astype('object')
-        df_proc[col] = df_proc[col].fillna('__MISSING__')
-        encoder = OneHotEncoder(sparse_output=False, drop='first', handle_unknown='ignore')
-        valid_data = df_proc[df_proc[col] != '__MISSING__'][[col]]
-        if len(valid_data) == 0:
-            raise ValueError(f"No valid data for categorical column {col}")
-        encoder.fit(valid_data)
-        transformed = encoder.transform(df_proc[[col]])
-        col_names = [f"{col}_{cat}" for cat in encoder.categories_[0][1:]]
-        encoded_cols.extend(col_names)
-        encoders[col] = encoder
-        categorical_dims[col] = len(col_names)
-        df_proc = pd.concat([df_proc.drop(col, axis=1), 
-                           pd.DataFrame(transformed, columns=col_names, index=df_proc.index)], axis=1)
-    
-    if not (numeric_cols or categorical_cols):
-        raise ValueError("No numerical or categorical columns with at least two categories found.")
-    
-    data = df_proc[encoded_cols].values.astype(np.float32)
-    mask = (~df_proc[encoded_cols].isna()).values.astype(np.float32)
-    data[np.isnan(data)] = 0.5
-    
-    # Check data variability
-    if data.std(axis=0).min() < 1e-6:
-        print("Warning: Low variability in encoded data. Training may be unstable.")
-    
-    print(f"Preprocessed data shape: {data.shape}")
-    print(f"Encoded columns: {encoded_cols}")
-    print(f"Categorical dimensions: {categorical_dims}")
-    return df_proc[encoded_cols], mask, scalers, encoders, numeric_cols, categorical_cols, categorical_dims
-
-# ----------------------
-# GAIN Model
-# ----------------------
-
-class GAIN:
-    def __init__(self, data_dim: int, numeric_cols: List[str], categorical_dims: Dict[str, int], 
-                 hidden_dim: int = 128, lr: float = 1e-4, alpha: float = 100, hint_rate: float = 0.9, grad_clip: float = 1.0):
-        self.data_dim = data_dim
-        self.numeric_cols = numeric_cols
-        self.categorical_dims = categorical_dims
+# Creating the Main GAIN Imputer
+class GAINImputer:
+    def __init__(self, data_dim: int, lr: float = 1e-3, alpha: float = 10, hint_rate: float = 0.9, hidden_dim: int = 128):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.G = Generator(data_dim, hidden_dim).to(self.device)
+        self.D = Discriminator(data_dim, hidden_dim).to(self.device)
+        self.optim_G = optim.Adam(self.G.parameters(), lr=lr, betas=(0.5, 0.9))
+        self.optim_D = optim.Adam(self.D.parameters(), lr=lr, betas=(0.5, 0.9))
         self.alpha = alpha
         self.hint_rate = hint_rate
-        self.grad_clip = grad_clip
-
-        self.G = Generator(data_dim, numeric_cols, categorical_dims)
-        self.D = Discriminator(data_dim)
-
-        self.optim_G = optim.Adam(self.G.parameters(), lr=lr)
-        self.optim_D = optim.Adam(self.D.parameters(), lr=lr)
-
         self.bce_loss = nn.BCELoss(reduction='none')
-
-    def train(self, data: torch.Tensor, mask: torch.Tensor, batch_size: int = 128, epochs: int = 1000):
-        N = data.shape[0]
-        for epoch in range(epochs):
-            perm = torch.randperm(N)
-            d_loss_total = 0.0
-            g_loss_total = 0.0
-            batch_count = 0
+    
+    def train(self, data: np.ndarray, mask: np.ndarray, batch_size: int = 64, epochs: int = 300):
+        data_tensor = torch.FloatTensor(data).to(self.device)
+        mask_tensor = torch.FloatTensor(mask).to(self.device)
+        n_samples = data.shape[0]
+        batches = (n_samples + batch_size - 1) // batch_size
+        
+        for epoch in tqdm(range(epochs), desc="Training GAIN"):
+            perm = torch.randperm(n_samples)
+            epoch_d_loss, epoch_g_loss = 0, 0
             
-            for i in range(0, N, batch_size):
-                batch_idx = perm[i:i + batch_size]
-                x = data[batch_idx]
-                m = mask[batch_idx]
-                z = sample_z(x.shape)
-                h = sample_h(m, self.hint_rate)
-
-                # Discriminator step
+            for i in range(0, n_samples, batch_size):
+                batch_idx = perm[i:min(i + batch_size, n_samples)]
+                x, m = data_tensor[batch_idx], mask_tensor[batch_idx]
+                noise = sample_noise(x.shape, self.device)
+                hint = sample_hint(m, self.hint_rate).to(self.device)
+                
+                # Train Discriminator
                 self.optim_D.zero_grad()
-                x_hat = self.G(x, m, z)
+                x_hat = self.G(x, m, noise)
                 x_completed = m * x + (1 - m) * x_hat
-                d_prob = self.D(x_completed.detach(), h)
-                d_loss = self.bce_loss(d_prob, m).mean(dim=1).sum()
+                d_prob = self.D(x_completed.detach(), hint)
+                d_loss = self.bce_loss(d_prob, m).mean()
                 d_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.D.parameters(), self.grad_clip)
                 self.optim_D.step()
-
-                # Generator step
+                
+                # Train Generator
                 self.optim_G.zero_grad()
-                x_hat = self.G(x, m, z)
+                x_hat = self.G(x, m, noise)
                 x_completed = m * x + (1 - m) * x_hat
-                d_prob = self.D(x_completed, h)
-                g_loss_adv = self.bce_loss(d_prob, torch.ones_like(d_prob)).mean(dim=1).sum()
-                g_loss_rec = ((x_hat - x) ** 2 * m).sum() / (m.sum() + 1e-8)
+                d_prob = self.D(x_completed, hint)
+                g_loss_adv = self.bce_loss(d_prob, torch.ones_like(d_prob)).mean()
+                g_loss_rec = ((m * (x - x_hat)) ** 2).mean() / m.mean()
                 g_loss = g_loss_adv + self.alpha * g_loss_rec
                 g_loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.G.parameters(), self.grad_clip)
                 self.optim_G.step()
-
-                d_loss_total += d_loss.item()
-                g_loss_total += g_loss.item()
-                batch_count += 1
-
-            if (epoch + 1) % 100 == 0 or epoch == 0:
-                print(f"Epoch [{epoch+1}/{epochs}] | D Loss: {d_loss_total/batch_count:.4f} | G Loss: {g_loss_total/batch_count:.4f}")
-
-    def impute(self, data: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
-        """Impute missing values using trained generator."""
-        z = sample_z(data.shape)
-        self.G.eval()
+                
+                epoch_d_loss += d_loss.item()
+                epoch_g_loss += g_loss.item()
+            
+            epoch_d_loss /= batches
+            epoch_g_loss /= batches
+            
+            if (epoch + 1) % 10 == 0:
+                print(f"Epoch {epoch + 1}/{epochs} - D Loss: {epoch_d_loss:.4f} - G Loss: {epoch_g_loss:.4f}")
+    
+    def impute(self, data: np.ndarray, mask: np.ndarray) -> np.ndarray:
+        data_tensor = torch.FloatTensor(data).to(self.device)
+        mask_tensor = torch.FloatTensor(mask).to(self.device)
+        noise = sample_noise(data_tensor.shape, self.device)
+        
         with torch.no_grad():
-            x_hat = self.G(data, mask, z)
-            imputed_data = mask * data + (1 - mask) * x_hat
-        self.G.train()
-        return imputed_data
+            x_hat = self.G(data_tensor, mask_tensor, noise)
+            imputed_data = mask_tensor * data_tensor + (1 - mask_tensor) * x_hat
+        
+        return imputed_data.cpu().numpy()
 
-def gain_impute(df: pd.DataFrame, config: Dict = None) -> pd.DataFrame:
-    if config is None:
-        config = {
-            'hint_rate': 0.9,
-            'alpha': 100,
-            'epochs': 300,
-            'batch_size': 64,
-            'lr': 1e-4,
-            'hidden_dim': 128,
-            'grad_clip': 1.0
-        }
+# Main Imputation Function
+def gain_impute_numerical(df: pd.DataFrame, 
+                                batch_size: int = 64, epends on the size of data
+                                epochs: int = 300, ### depends on the size of data
+                                lr: float = 1e-3, epends on the size of data
+                                alpha: float = 10, epends on the size of data
+                                hint_rate: float = 0.9) -> pd.DataFrame:
+    print(f"Starting GAIN imputation for numerical variables in DataFrame of shape {df.shape} with {df.isna().sum().sum()} missing values")
     
-    df_proc, mask, scalers, encoders, numeric_cols, categorical_cols, categorical_dims = preprocess_data(df)
-    data_tensor = torch.tensor(df_proc.values, dtype=torch.float32)
-    mask_tensor = torch.tensor(mask, dtype=torch.float32)
+    preprocessor = DataPreprocessor()
+    data, mask, encoded_cols = preprocessor.fit_transform(df)
     
-    gain = GAIN(data_dim=data_tensor.shape[1], numeric_cols=numeric_cols, categorical_dims=categorical_dims,
-                hidden_dim=config['hidden_dim'], lr=config['lr'], alpha=config['alpha'], 
-                hint_rate=config['hint_rate'], grad_clip=config['grad_clip'])
+    imputer = GAINImputer(data_dim=data.shape[1], lr=lr, alpha=alpha, hint_rate=hint_rate)
+    imputer.train(data, mask, batch_size=batch_size, epochs=epochs)
     
-    gain.train(data_tensor, mask_tensor, batch_size=config['batch_size'], epochs=config['epochs'])
+    print("Generating imputed data...")
+    imputed_data = imputer.impute(data, mask)
     
-    imputed_data = gain.impute(data_tensor, mask_tensor)
-    df_imputed = pd.DataFrame(imputed_data.numpy(), columns=df_proc.columns)
+    print("Converting back to original format...")
+    result_df = preprocessor.inverse_transform(imputed_data, encoded_cols)
     
-    # Inverse transform numerical columns
-    for col in numeric_cols:
-        df_imputed[col] = scalers[col].inverse_transform(df_imputed[[col]].values)
+    print(f"Imputation completed. Output shape: {result_df.shape}, remaining missing values: {result_df.isna().sum().sum()}")
     
-    # Inverse transform categorical columns
-    result_df = df.copy().reset_index(drop=True)
-    for col in categorical_cols:
-        cat_cols = [c for c in df_imputed.columns if c.startswith(f"{col}_")]
-        cat_vals = df_imputed[cat_cols].values
-        if len(cat_cols) == 1:  # Binary categorical
-            values = cat_vals.flatten()
-            categories = encoders[col].categories_[0]
-            result_df[col] = np.where(values > 0.5, categories[1], categories[0])
-        else:  # Multi-class categorical
-            decoded = encoders[col].inverse_transform(cat_vals)
-            result_df[col] = decoded.flatten()
-    
-    return result_df[numeric_cols + categorical_cols]
+    return result_df
+
+############ Trail for Numerical Data Impuation 
+### Check the distribution of a numerical variable
+imputed_data['age'].value_counts()
+
+########## Imputing with Numerical Variables #########
+imputed_data =  gain_impute(SADat2[['pweight', 'age', 'height','weight', 'WC', 'HC', 'BPs']])
+imputed_dfSA1=imputed_data.round(2)
+imputed_dfSA1
 
 
-print(imputed_data)
+######################################################################################################################
+################  GAIN for Categorical variables 
 
-### Check the distribution of one of the variables
-imputed_data['sex'].value_counts()
+########## GAIN for Categories### 
+
+########## Categorical Data Imputation #########
+
+# ========== Helper Functions ==========
+
+def sample_z(shape: Tuple[int, ...]) -> torch.Tensor:
+    return torch.rand(shape)
+
+def sample_h(mask: torch.Tensor, hint_rate: float = 0.9) -> torch.Tensor:
+    B = torch.rand_like(mask) < hint_rate
+    return B.float() * mask + (1 - B.float()) * 0.5
+
+# ========== Generator Network ==========
+
+class Generator(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim * 2, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, input_dim),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x, m):
+        return self.model(torch.cat([x, m], dim=1))
+
+# ========== Discriminator Network ==========
+
+class Discriminator(nn.Module):
+    def __init__(self, input_dim):
+        super().__init__()
+        self.model = nn.Sequential(
+            nn.Linear(input_dim * 2, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, 256),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(256, input_dim),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x, h):
+        return self.model(torch.cat([x, h], dim=1))
+
+# ========== Preprocessor for Categorical Variables ==========
+
+class CategoricalPreprocessor:
+    def __init__(self):
+        self.encoder = OneHotEncoder(sparse_output=False, handle_unknown='ignore')
+        self.original_columns = []
+
+    def fit_transform(self, df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+        self.original_columns = df.columns.tolist()
+        
+        # Convert categorical dtype to object to allow "missing" placeholder
+        for col in df.columns:
+            if pd.api.types.is_categorical_dtype(df[col]):
+                df[col] = df[col].astype('object')
+
+        mask = ~df.isnull()
+        df_filled = df.fillna("missing")
+
+        encoded = self.encoder.fit_transform(df_filled)
+
+        # Generate mask for each one-hot feature
+        mask_array = np.concatenate([
+            np.repeat(mask[[col]].astype(float).values, len(cats), axis=1)
+            for col, cats in zip(self.original_columns, self.encoder.categories_)
+        ], axis=1)
+
+        return encoded.astype(np.float32), mask_array.astype(np.float32)
+
+    def inverse_transform(self, data: np.ndarray) -> pd.DataFrame:
+        decoded = self.encoder.inverse_transform(data)
+        return pd.DataFrame(decoded, columns=self.original_columns)
+
+# ========== GAIN Model for Categorical Data ==========
+
+class GAIN:
+    def __init__(self, data_dim, lr=1e-3, alpha=10, hint_rate=0.9):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.G = Generator(data_dim).to(self.device)
+        self.D = Discriminator(data_dim).to(self.device)
+        self.optim_G = optim.Adam(self.G.parameters(), lr=lr)
+        self.optim_D = optim.Adam(self.D.parameters(), lr=lr)
+        self.alpha = alpha
+        self.hint_rate = hint_rate
+
+    def train(self, data, mask, batch_size=64, epochs=300):
+        data_tensor = torch.tensor(data).to(self.device)
+        mask_tensor = torch.tensor(mask).to(self.device)
+
+        for epoch in range(epochs):
+            indices = torch.randperm(len(data_tensor))[:batch_size]
+            x = data_tensor[indices]
+            m = mask_tensor[indices]
+            z = sample_z(x.shape).to(self.device)
+            x_input = m * x + (1 - m) * z
+            h = sample_h(m, self.hint_rate).to(self.device)
+
+            # ----- Discriminator Step -----
+            with torch.no_grad():
+                x_fake = self.G(x_input, m)
+            x_hat = m * x + (1 - m) * x_fake
+            d_prob = self.D(x_hat, h)
+            d_loss = -torch.mean(m * torch.log(d_prob + 1e-8) +
+                                 (1 - m) * torch.log(1 - d_prob + 1e-8))
+            self.optim_D.zero_grad()
+            d_loss.backward()
+            self.optim_D.step()
+
+            # ----- Generator Step -----
+            x_fake = self.G(x_input, m)
+            x_hat = m * x + (1 - m) * x_fake
+            d_prob = self.D(x_hat, h)
+            g_loss_adv = -torch.mean((1 - m) * torch.log(d_prob + 1e-8))
+            g_loss_rec = torch.mean(m * (x - x_fake) ** 2) / torch.mean(m)
+            g_loss = g_loss_adv + self.alpha * g_loss_rec
+            self.optim_G.zero_grad()
+            g_loss.backward()
+            self.optim_G.step()
+
+            if (epoch + 1) % 50 == 0:
+                print(f"Epoch {epoch + 1}/{epochs} | D Loss: {d_loss.item():.4f} | G Loss: {g_loss.item():.4f}")
+
+    def impute(self, data, mask):
+        data_tensor = torch.tensor(data).to(self.device)
+        mask_tensor = torch.tensor(mask).to(self.device)
+        z = sample_z(data.shape).to(self.device)
+        x_input = mask_tensor * data_tensor + (1 - mask_tensor) * z
+        with torch.no_grad():
+            x_fake = self.G(x_input, mask_tensor)
+            x_imputed = mask_tensor * data_tensor + (1 - mask_tensor) * x_fake
+        return x_imputed.cpu().numpy()
+
+# ========== Final Function to Use ==========
+
+def gain_impute_categorical(df: pd.DataFrame) -> pd.DataFrame:
+    print("Preparing categorical data for GAIN imputation...")
+
+    # Filter categorical columns only
+    cat_df = df.select_dtypes(include=['object', 'category', 'bool']).copy()
+
+    # Convert Categorical columns to object dtype
+    for col in cat_df.columns:
+        if pd.api.types.is_categorical_dtype(cat_df[col]):
+            cat_df[col] = cat_df[col].astype('object')
+
+    # Preprocess and encode
+    preprocessor = CategoricalPreprocessor()
+    data, mask = preprocessor.fit_transform(cat_df)
+
+    # Train GAIN model
+    gain = GAIN(data_dim=data.shape[1])
+    gain.train(data, mask, batch_size=64, epochs=300)
+
+    # Perform imputation
+    imputed_data = gain.impute(data, mask)
+    result = preprocessor.inverse_transform(imputed_data)
+
+    print("Categorical imputation complete.")
+    return result
+
+              ####### Categorical Data ######
+########## Imputing with the GAIN Imputer Variables #########
+imputed_data2 =  gain_impute_categorical(SADat2.drop(columns=['Numerical Variables for retain only Categorical Variables']))
+
+imputed_dfSA2=imputed_data2
+imputed_dfSA2
+
+######### Merging All the Data Types ###### Merging All the Data Types #######
+imputed_dfSA=pd.concat([imputed_dfSA1, imputed_dfSA2], axis=1)
+imputed_dfSA
+
 
