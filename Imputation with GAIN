@@ -7,15 +7,6 @@
 !pip install torch scikit-learn tensorflow  keras
 
 ###### Creating GAIN for Imputations
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch.utils.data import DataLoader, TensorDataset
-from sklearn.preprocessing import LabelEncoder, MinMaxScaler
-from sklearn.utils import shuffle
-import numpy as np
-import pandas as pd
-
 
 #### #####
 !pip install keras torch tensorflow 
