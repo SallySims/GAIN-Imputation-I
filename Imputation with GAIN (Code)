@@ -223,7 +223,7 @@ def gain_impute_numerical(df: pd.DataFrame,
 imputed_data['age'].value_counts()
 
 ########## Imputing with Numerical Variables #########
-imputed_data =  gain_impute(SADat2[['pweight', 'age', 'height','weight', 'WC', 'HC', 'BPs']])
+imputed_data =  gain_impute_numerical(SADat2[['pweight', 'age', 'height','weight', 'WC', 'HC', 'BPs']])
 imputed_dfSA1=imputed_data.round(2)
 imputed_dfSA1
 
