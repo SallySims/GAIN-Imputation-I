@@ -219,11 +219,28 @@ def gain_impute_numerical(df: pd.DataFrame,
     return result_df
 
 ############ Trail for Numerical Data Impuation 
+########## Imputing with the GAIN Imputer Variables #########
+### Making outcomes stagnant/unchangeable
+import random
+import numpy as np
+import torch
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+# Call this once at the very start before any training
+set_seed(42)
+
 ### Check the distribution of a numerical variable
 imputed_data['age'].value_counts()
 
 ########## Imputing with Numerical Variables #########
-imputed_data =  gain_impute_numerical(SADat2[['pweight', 'age', 'height','weight', 'WC', 'HC', 'BPs']])
+imputed_data =  gain_impute_numerical(SADat2[['pweight', 'age', 'height','weight', 'WC', 'BPs']])
 imputed_dfSA1=imputed_data.round(2)
 imputed_dfSA1
 
@@ -403,6 +420,23 @@ def gain_impute_categorical(df: pd.DataFrame) -> pd.DataFrame:
 
               ####### Categorical Data ######
 ########## Imputing with the GAIN Imputer Variables #########
+########## Imputing with the GAIN Imputer Variables #########
+import random
+import numpy as np
+import torch
+
+def set_seed(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+# Call this once at the very start before any training
+set_seed(42)
+
+
 imputed_data2 =  gain_impute_categorical(SADat2.drop(columns=['Numerical Variables for retain only Categorical Variables']))
 
 imputed_dfSA2=imputed_data2
